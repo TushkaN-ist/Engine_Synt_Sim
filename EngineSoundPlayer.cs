@@ -12,7 +12,13 @@ namespace RpmSynth
         [SerializeField, Range(0, 1)] private float load = 1;
         [SerializeField, Range(0, 1)] private float gain = 0.8f;
         [SerializeField, Range(0, 1)] private float texture = 0.5f;
+        [SerializeField, Range(0, 2)] private float mechanicalDetail = 1f;
+        [SerializeField, Range(0, 2)] private float resonantAttacks = 1f;
+        // Keep previously serialized instance settings until the profile has a saved trim.
+        [SerializeField, HideInInspector]
+        private float backgroundTrimDb;
         private AudioSource source;
+        private EngineSoundProfile playbackProfile;
         private AudioClip engineClip, previousClip;
         private bool previousLoop;
         private EngineSoundSynth synth;
@@ -31,6 +37,7 @@ namespace RpmSynth
         {
             if (profile == null || profile.MaximumRpm <= profile.MinimumRpm)
                 return;
+            playbackProfile = profile;
             source = GetComponent<AudioSource>();
             previousClip = source.clip;
             previousLoop = source.loop;
@@ -43,7 +50,7 @@ namespace RpmSynth
             sampleRate = AudioSettings.outputSampleRate;
             AudioSettings.GetDSPBufferSize(out int blockSize, out _);
             block = new float[blockSize];
-            synth = profile.CreateSynth(sampleRate, Volatile.Read(ref rpm), interactive: true);
+            synth = playbackProfile.CreateSynth(sampleRate, Volatile.Read(ref rpm), interactive: true);
             engineClip = AudioClip.Create("Engine synthesis", blockSize * 16, 1, sampleRate, false);
             playhead = writeHead = queued = 0;
             FillAhead(0);
@@ -74,10 +81,13 @@ namespace RpmSynth
             float frames = Mathf.Max(2f * block.Length, frameSeconds * sampleRate);
             int target = Mathf.Clamp(Mathf.CeilToInt((frames + block.Length) * Mathf.Max(1f, source.pitch)),
                 block.Length * 3, engineClip.samples - block.Length * 2);
+            float trim = playbackProfile != null && playbackProfile.HasSavedBackgroundTrim
+                ? playbackProfile.BackgroundTrimDb : backgroundTrimDb;
             while (queued < target)
             {
                 synth.Render(block, Volatile.Read(ref rpm), Volatile.Read(ref load),
-                    Volatile.Read(ref gain), Volatile.Read(ref texture));
+                    Volatile.Read(ref gain), Volatile.Read(ref texture), Volatile.Read(ref mechanicalDetail),
+                    Volatile.Read(ref resonantAttacks), trim);
                 engineClip.SetData(block, writeHead);
                 writeHead = (writeHead + block.Length) % engineClip.samples;
                 queued += block.Length;
@@ -86,7 +96,7 @@ namespace RpmSynth
 
         private void OnAudioConfigurationChanged(bool deviceWasChanged)
         {
-            if (engineClip == null || source.clip != engineClip) return;
+            if (engineClip == null || source.clip != engineClip || playbackProfile == null) return;
             int rate = AudioSettings.outputSampleRate;
             AudioSettings.GetDSPBufferSize(out int blockSize, out _);
             if (rate != sampleRate || blockSize != block.Length)
@@ -101,6 +111,7 @@ namespace RpmSynth
         {
             AudioSettings.OnAudioConfigurationChanged -= OnAudioConfigurationChanged;
             synth = null;
+            playbackProfile = null;
             if (engineClip == null) return;
             if (source != null && source.clip == engineClip)
             {
