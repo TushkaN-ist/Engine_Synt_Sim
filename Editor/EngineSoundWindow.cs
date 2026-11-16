@@ -30,7 +30,7 @@ namespace RpmSynth.Editor
         private float mechanicalDetail = 1;
         private float resonantAttacks = 1;
         private float backgroundTrimDb;
-        private bool analysisSettingsOpen, trackingDetailsOpen, rpmMappingOpen, soundTuningOpen, wavExportOpen;
+        private bool analysisSettingsOpen, trackingDetailsOpen, rpmMappingOpen, soundTuningOpen, advancedSoundOpen, wavExportOpen;
         private bool livePreview;
 #if UNITY_EDITOR_WIN
         private WindowsLiveAudio liveAudio;
@@ -85,9 +85,10 @@ namespace RpmSynth.Editor
             else if (analysis == null && savedProfile != null && savedProfile.MaximumRpm > savedProfile.MinimumRpm)
             {
                 DrawPreviewControls(savedProfile.MinimumRpm, savedProfile.MaximumRpm);
-                if (savedProfile.HasResidualSpectrum && backgroundTrimDb != savedProfile.BackgroundTrimDb
-                    && GUILayout.Button("Save Trim to Profile"))
-                    Run(SaveLoadedProfileTrim);
+                bool settingsChanged = texture != savedProfile.NoiseAndVariation
+                    || (savedProfile.HasResidualSpectrum && backgroundTrimDb != savedProfile.BackgroundTrimDb);
+                if (settingsChanged && GUILayout.Button("Save Profile Settings"))
+                    Run(SaveLoadedProfileSettings);
                 DrawWavExport();
             }
             if (!string.IsNullOrEmpty(error)) EditorGUILayout.HelpBox(error, MessageType.Error);
@@ -289,13 +290,23 @@ namespace RpmSynth.Editor
 
         private void DrawSoundTuning()
         {
+            Volatile.Write(ref texture, EditorGUILayout.Slider(new GUIContent("Noise and Variation",
+                "Sets the amount of residual noise and small cycle-to-cycle variations."),
+                texture, 0, 1));
             bool hasNoiseSpectrum = result != null ? ActiveAnalysis.ResidualSpectrum != null : savedProfile.HasResidualSpectrum;
             if (hasNoiseSpectrum)
                 Volatile.Write(ref backgroundTrimDb, EditorGUILayout.Slider(new GUIContent("Background Noise Trim (dB)",
                     "Reduces steady noise around 2–8 kHz. Saving the profile stores this setting for playback and export."),
                     backgroundTrimDb, 0, EngineResidualNoise.MaximumBackgroundTrimDb));
-            Volatile.Write(ref load, EditorGUILayout.Slider("Load", load, 0, 1));
-            Volatile.Write(ref texture, EditorGUILayout.Slider("Noise and Variation", texture, 0, 1));
+            advancedSoundOpen = EditorGUILayout.Foldout(advancedSoundOpen, "Advanced Sound", true);
+            if (!advancedSoundOpen) return;
+            using (new EditorGUI.IndentLevelScope())
+                DrawAdvancedSound();
+        }
+
+        private void DrawAdvancedSound()
+        {
+            Volatile.Write(ref load, EditorGUILayout.Slider("Preview Load", load, 0, 1));
             bool hasMechanical = result != null ? ActiveAnalysis.MechanicalEnvelope != null
                 : savedProfile.HasMechanicalDetail;
             if (hasMechanical)
@@ -351,6 +362,7 @@ namespace RpmSynth.Editor
             {
                 savedProfile = null;
                 backgroundTrimDb = 0;
+                texture = 0.5f;
             }
             from = 0;
             to = recording == null ? 0 : recording.length;
@@ -363,6 +375,7 @@ namespace RpmSynth.Editor
             ClearResult();
             savedProfile = profile;
             backgroundTrimDb = profile != null ? profile.BackgroundTrimDb : 0;
+            texture = profile != null ? profile.NoiseAndVariation : 0.5f;
             if (profile != null) rpm = profile.MinimumRpm;
         }
 
@@ -451,6 +464,7 @@ namespace RpmSynth.Editor
                 {
                     savedProfile = null;
                     backgroundTrimDb = 0;
+                    texture = 0.5f;
                 }
                 result = output;
                 rpm = output.Data.Rpm[0];
@@ -615,6 +629,7 @@ namespace RpmSynth.Editor
                 profile = CreateInstance<EngineSoundProfile>();
                 profile.SetData(data);
                 profile.SetBackgroundTrim(backgroundTrimDb);
+                profile.SetNoiseAndVariation(texture);
                 AssetDatabase.CreateAsset(profile, path);
             }
             else
@@ -622,16 +637,20 @@ namespace RpmSynth.Editor
                 Undo.RecordObject(profile, "Update engine sound profile");
                 profile.SetData(data);
                 profile.SetBackgroundTrim(backgroundTrimDb);
+                profile.SetNoiseAndVariation(texture);
                 EditorUtility.SetDirty(profile);
             }
             AssetDatabase.SaveAssets();
             EditorGUIUtility.PingObject(profile);
         }
 
-        private void SaveLoadedProfileTrim()
+        private void SaveLoadedProfileSettings()
         {
-            Undo.RecordObject(savedProfile, "Change background noise trim");
-            savedProfile.SetBackgroundTrim(backgroundTrimDb);
+            Undo.RecordObject(savedProfile, "Change engine sound settings");
+            if (savedProfile.HasResidualSpectrum && backgroundTrimDb != savedProfile.BackgroundTrimDb)
+                savedProfile.SetBackgroundTrim(backgroundTrimDb);
+            if (texture != savedProfile.NoiseAndVariation)
+                savedProfile.SetNoiseAndVariation(texture);
             EditorUtility.SetDirty(savedProfile);
             AssetDatabase.SaveAssetIfDirty(savedProfile);
         }

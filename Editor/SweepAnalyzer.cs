@@ -311,6 +311,8 @@ namespace RpmSynth.Editor
             var sine = new float[cosine.Length];
             var residual = new float[keys * 3];
             var residualSpectrum = new float[keys * EngineResidualNoise.BandCount];
+            var modulation = new float[keys * 2 * EngineSoundData.NoisePhaseBins];
+            var bandModulation = new float[keys * EngineResidualNoise.BandCount * EngineSoundData.NoisePhaseBins];
             const int phaseBins = EngineSoundData.MechanicalPhaseBins;
             var mechanical = new float[keys * phaseBins];
             var real = new double[AnalysisFftSize];
@@ -320,6 +322,7 @@ namespace RpmSynth.Editor
             var harmonicWave = new double[AnalysisFftSize / WindowCycles];
             var harmonicImag = new double[harmonicWave.Length];
             var attackAnalyzer = new ResonantAttackAnalyzer(harmonicWave.Length, WindowCycles);
+            var modulationAnalyzer = new ResidualModulationAnalyzer(harmonicWave.Length, WindowCycles);
             var attacks = new float[keys * EngineAttackData.Stride];
             bool hasAttacks = false;
             var phaseEnergy = new double[WindowCycles * phaseBins];
@@ -401,6 +404,8 @@ namespace RpmSynth.Editor
                 EngineSoundFft.Transform(harmonicWave, harmonicImag, inverse: true);
                 foreach (double sample in harmonicWave) peak = Math.Max(peak, Math.Abs(sample));
                 int phaseShift = key > 0 ? Align(cosine, sine, key, harmonics) : 0;
+                modulationAnalyzer.Extract(cycleSamples, harmonicWave, frequency, rate, phaseShift,
+                    modulation, bandModulation, key);
                 hasAttacks |= attackAnalyzer.Extract(cycleSamples, harmonicWave, frequency, phaseShift, attacks, key);
                 ExtractMechanical(cycleSamples, harmonicWave, phaseEnergy, frequency,
                     phaseShift, mechanical, key * phaseBins);
@@ -428,7 +433,8 @@ namespace RpmSynth.Editor
                 hasMechanical |= mechanical[i] > 0.001f;
             }
             return new EngineSoundData(revolutions, harmonics, rpm, cosine, sine, residual,
-                hasMechanical ? mechanical : null, residualSpectrum, hasAttacks ? attacks : null);
+                hasMechanical ? mechanical : null, residualSpectrum, hasAttacks ? attacks : null, modulation,
+                bandResidualModulation: bandModulation);
         }
 
         private static double Power(double[] real, double[] imag, int bin) =>

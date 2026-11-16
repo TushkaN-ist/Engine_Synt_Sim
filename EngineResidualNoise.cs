@@ -6,13 +6,29 @@ namespace RpmSynth
     {
         private static readonly int[] Edges = { 40, 90, 180, 355, 710, 1100, 1600, 2400, 3500, 5000, 7000, 10000, 14000, 20000 };
         public const int BandCount = 13;
+        public const int BodyModulationStartHz = 710;
+        public const int HighModulationStartHz = 2400;
         public const float MaximumBackgroundTrimDb = 18f;
+        private static readonly float[] FocusWeights = BuildFocusWeights();
         private readonly Band[] bands;
         private readonly int sampleRate;
         private readonly float trimSmoothing;
         private Shelf lowerShelf, upperShelf;
         private float trimDb;
         private bool trimActive;
+
+        private static float[] BuildFocusWeights()
+        {
+            var weights = new float[BandCount];
+            for (int i = 0; i < weights.Length; i++)
+            {
+                int low = Math.Max(3000, Edges[i]), high = Math.Min(8000, Edges[i + 1]);
+                if (high > low)
+                    weights[i] = (float)(Math.Log((double)high / low) /
+                        Math.Log((double)Edges[i + 1] / Edges[i]));
+            }
+            return weights;
+        }
 
         private struct Shelf
         {
@@ -136,11 +152,20 @@ namespace RpmSynth
             return i;
         }
 
-        internal float Render(float[] levels, int key, int nextKey, float mix, uint seed, out float attack)
+        public static int LowerEdge(int band) => Edges[band];
+        public static int UpperEdge(int band) => Edges[band + 1];
+
+        internal float Render(float[] levels, int key, int nextKey, float mix, uint seed, out float attack,
+            float bodyModulation = 1, float highModulation = 1, float focusedPower = -1,
+            float[] bandPower = null, double phase = 0)
         {
             float sum = 0;
             float high = 0, highPower = 0;
             int left = key * BandCount, right = nextKey * BandCount;
+            const int phaseBins = EngineSoundData.NoisePhaseBins;
+            double position = phase * phaseBins;
+            int phaseIndex = (int)position, nextPhase = (phaseIndex + 1) % phaseBins;
+            float phaseMix = (float)(position - phaseIndex);
             unchecked
             {
                 seed = (seed ^ (seed >> 16)) * 0x21F0AAADu;
@@ -156,7 +181,23 @@ namespace RpmSynth
                 float level = levels[left + i];
                 level += (levels[right + i] - level) * mix;
                 float value = band.Process(white) * band.Gain * level;
-                sum += value;
+                float modulation = Edges[i] >= HighModulationStartHz ? highModulation
+                    : Edges[i] >= BodyModulationStartHz ? bodyModulation : 1f;
+                if (bandPower != null)
+                {
+                    int a = (left + i) * phaseBins, b = (right + i) * phaseBins;
+                    float aPower = bandPower[a + phaseIndex];
+                    float bPower = bandPower[b + phaseIndex];
+                    aPower += (bandPower[a + nextPhase] - aPower) * phaseMix;
+                    bPower += (bandPower[b + nextPhase] - bPower) * phaseMix;
+                    modulation = (float)Math.Sqrt(aPower + (bPower - aPower) * mix);
+                }
+                if (focusedPower >= 0 && FocusWeights[i] > 0)
+                {
+                    float highEnergy = modulation * modulation;
+                    modulation = (float)Math.Sqrt(highEnergy + (focusedPower - highEnergy) * FocusWeights[i]);
+                }
+                sum += value * modulation;
                 if (Edges[i] >= 1600)
                 {
                     high += value;

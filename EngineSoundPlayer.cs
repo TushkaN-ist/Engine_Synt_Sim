@@ -83,10 +83,12 @@ namespace RpmSynth
                 block.Length * 3, engineClip.samples - block.Length * 2);
             float trim = playbackProfile != null && playbackProfile.HasSavedBackgroundTrim
                 ? playbackProfile.BackgroundTrimDb : backgroundTrimDb;
+            float noise = playbackProfile != null && playbackProfile.HasSavedNoiseAndVariation
+                ? playbackProfile.NoiseAndVariation : Volatile.Read(ref texture);
             while (queued < target)
             {
                 synth.Render(block, Volatile.Read(ref rpm), Volatile.Read(ref load),
-                    Volatile.Read(ref gain), Volatile.Read(ref texture), Volatile.Read(ref mechanicalDetail),
+                    Volatile.Read(ref gain), noise, Volatile.Read(ref mechanicalDetail),
                     Volatile.Read(ref resonantAttacks), trim);
                 engineClip.SetData(block, writeHead);
                 writeHead = (writeHead + block.Length) % engineClip.samples;

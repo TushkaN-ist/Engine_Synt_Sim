@@ -5,16 +5,21 @@ namespace RpmSynth
     public sealed class EngineSoundData
     {
         public const int MechanicalPhaseBins = 128;
+        public const int NoisePhaseBins = 128;
         public readonly int RevolutionsPerCycle;
         public readonly int Harmonics;
         public readonly float[] Rpm, Cosine, Sine, Residual;
         public readonly float[] MechanicalEnvelope;
         public readonly float[] ResidualSpectrum;
         public readonly float[] ResonantAttacks;
+        public readonly float[] ResidualModulation;
+        public readonly float[] FocusedResidualModulation;
+        public readonly float[] BandResidualModulation;
 
         public EngineSoundData(int revolutionsPerCycle, int harmonics, float[] rpm, float[] cosine,
             float[] sine, float[] residual, float[] mechanicalEnvelope = null, float[] residualSpectrum = null,
-            float[] resonantAttacks = null)
+            float[] resonantAttacks = null, float[] residualModulation = null, float[] focusedResidualModulation = null,
+            float[] bandResidualModulation = null)
         {
             RevolutionsPerCycle = revolutionsPerCycle;
             Harmonics = harmonics;
@@ -25,6 +30,9 @@ namespace RpmSynth
             MechanicalEnvelope = mechanicalEnvelope;
             ResidualSpectrum = residualSpectrum;
             ResonantAttacks = resonantAttacks;
+            ResidualModulation = residualModulation;
+            FocusedResidualModulation = focusedResidualModulation;
+            BandResidualModulation = bandResidualModulation;
         }
 
         public EngineSoundData RemapRpm(float minimum, float maximum)
@@ -47,7 +55,8 @@ namespace RpmSynth
                     throw new ArgumentException("The saved RPM range is too narrow for this profile.");
             }
             return new EngineSoundData(RevolutionsPerCycle, Harmonics, mapped, Cosine, Sine, Residual,
-                MechanicalEnvelope, ResidualSpectrum, ResonantAttacks);
+                MechanicalEnvelope, ResidualSpectrum, ResonantAttacks, ResidualModulation, FocusedResidualModulation,
+                BandResidualModulation);
         }
     }
 
@@ -61,6 +70,9 @@ namespace RpmSynth
         private readonly float[][] tables;
         private readonly float[] mechanicalEnvelope;
         private readonly float[] residualSpectrum;
+        private readonly float[] residualModulation;
+        private readonly float[] focusedResidualModulation;
+        private readonly float[] bandResidualModulation;
         private readonly float[] resonantAttacks;
         private readonly EngineResidualNoise coloredNoise;
         private readonly float defaultBackgroundTrimDb;
@@ -82,6 +94,9 @@ namespace RpmSynth
             rpmKeys = ExtendKeys(profile.Rpm);
             mechanicalEnvelope = GetMechanicalEnvelope(profile);
             residualSpectrum = GetResidualSpectrum(profile);
+            residualModulation = GetResidualModulation(profile);
+            focusedResidualModulation = GetFocusedModulation(profile);
+            bandResidualModulation = GetBandModulation(profile);
             resonantAttacks = EngineAttackData.ForSampleRate(GetResonantAttacks(profile), sampleRate);
             this.defaultBackgroundTrimDb = defaultBackgroundTrimDb;
             if (residualSpectrum != null)
@@ -139,7 +154,8 @@ namespace RpmSynth
                 if (coloredNoise != null)
                 {
                     // Texture 0.5 reproduces the measured residual level.
-                    noise = 2 * coloredNoise.Render(residualSpectrum, a, b, mix, random, out shapedAttack);
+                    noise = 2 * RenderResidual(coloredNoise, residualSpectrum, residualModulation, focusedResidualModulation,
+                        bandResidualModulation, a, b, mix, phase, random, out shapedAttack);
                 }
                 else
                 {
@@ -199,6 +215,9 @@ namespace RpmSynth
             var attacks = attackGain > 0 ? EngineAttackData.ForSampleRate(GetResonantAttacks(data), sampleRate) : null;
             double loopFrequency = (double)cycles * sampleRate / length;
             var spectrum = GetResidualSpectrum(data);
+            var modulation = GetResidualModulation(data);
+            var focused = GetFocusedModulation(data);
+            var bandPower = GetBandModulation(data);
             float noiseGain = Unit(texture);
             float detailGain = DetailGain(mechanicalDetail);
             var coloredNoise = spectrum != null && (noiseGain > 0 || (envelope != null && detailGain > 0))
@@ -211,14 +230,19 @@ namespace RpmSynth
                     filtered += filter * (LoopNoise((i % length + length) % length) - filtered);
             if (coloredNoise != null)
                 for (int i = -sampleRate / 4; i < 0; i++)
-                    coloredNoise.Render(spectrum, key, key + 1, mix, LoopSeed((i % length + length) % length), out _);
+                {
+                    double p = (double)(((long)i * cycles % length + length) % length) / length;
+                    RenderResidual(coloredNoise, spectrum, modulation, focused, bandPower, key, key + 1, mix, p,
+                        LoopSeed((i % length + length) % length), out _);
+                }
             for (int i = 0; i < length; i++)
             {
                 double cyclePhase = (double)((long)i * cycles % length) / length;
                 float sample = Read(table, cyclePhase);
                 float shapedAttack = 0;
                 if (coloredNoise != null)
-                    sample += 2 * noiseGain * coloredNoise.Render(spectrum, key, key + 1, mix, LoopSeed(i), out shapedAttack);
+                    sample += 2 * noiseGain * RenderResidual(coloredNoise, spectrum, modulation, focused, bandPower, key, key + 1,
+                        mix, cyclePhase, LoopSeed(i), out shapedAttack);
                 if (envelope != null && detailGain > 0)
                 {
                     if (coloredNoise == null)
@@ -244,6 +268,34 @@ namespace RpmSynth
             data.ResidualSpectrum?.Length == data.Rpm.Length * EngineResidualNoise.BandCount
                 ? data.ResidualSpectrum : null;
 
+        private static float[] GetResidualModulation(EngineSoundData data) =>
+            data.ResidualModulation?.Length == data.Rpm.Length * 2 * EngineSoundData.NoisePhaseBins
+                ? data.ResidualModulation : null;
+
+        private static float[] GetFocusedModulation(EngineSoundData data) =>
+            data.FocusedResidualModulation?.Length == data.Rpm.Length * EngineSoundData.NoisePhaseBins
+                ? data.FocusedResidualModulation : null;
+
+        private static float[] GetBandModulation(EngineSoundData data) =>
+            data.BandResidualModulation?.Length == data.Rpm.Length * EngineResidualNoise.BandCount * EngineSoundData.NoisePhaseBins
+                ? data.BandResidualModulation : null;
+
+        private static float RenderResidual(EngineResidualNoise noise, float[] levels, float[] modulation,
+            float[] focused, float[] bandPower, int a, int b, float mix, double phase, uint seed, out float attack)
+        {
+            const int bins = EngineSoundData.NoisePhaseBins;
+            float focusedPower = focused == null ? -1 : ReadEnvelope(focused, a, b, mix, phase, bins);
+            if (bandPower != null)
+                return noise.Render(levels, a, b, mix, seed, out attack, focusedPower: focusedPower,
+                    bandPower: bandPower, phase: phase);
+            if (modulation == null)
+                return noise.Render(levels, a, b, mix, seed, out attack);
+            float body = ReadEnvelope(modulation, a * 2, b * 2, mix, phase, bins);
+            float high = ReadEnvelope(modulation, a * 2 + 1, b * 2 + 1, mix, phase, bins);
+            return noise.Render(levels, a, b, mix, seed, out attack,
+                (float)Math.Sqrt(body), (float)Math.Sqrt(high), focusedPower);
+        }
+
         private static float[] GetResonantAttacks(EngineSoundData data) =>
             EngineAttackData.HasAttacks(data.ResonantAttacks, data.Rpm.Length) ? data.ResonantAttacks : null;
 
@@ -257,9 +309,9 @@ namespace RpmSynth
 
         private static float MechanicalFilter(int rate) => (float)(1 - Math.Exp(-2 * Math.PI * 1600 / rate));
 
-        private static float ReadEnvelope(float[] data, int a, int b, float mix, double phase)
+        private static float ReadEnvelope(float[] data, int a, int b, float mix, double phase,
+            int bins = EngineSoundData.MechanicalPhaseBins)
         {
-            const int bins = EngineSoundData.MechanicalPhaseBins;
             double position = phase * bins;
             int i = (int)position, j = (i + 1) % bins;
             float fraction = (float)(position - i);
