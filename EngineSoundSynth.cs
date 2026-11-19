@@ -63,6 +63,7 @@ namespace RpmSynth
     public sealed class EngineSoundSynth
     {
         internal const int TableLength = 512;
+        public const float DefaultPlaybackGain = 0.8f;
         public const float MinimumLoopRpm = 100;
         public const float MaximumSupportedRpm = 30000;
         private readonly float[] rpmKeys, residual;
@@ -76,6 +77,7 @@ namespace RpmSynth
         private readonly float[] resonantAttacks;
         private readonly EngineResidualNoise coloredNoise;
         private readonly float defaultBackgroundTrimDb;
+        private bool trimInitialized;
         private readonly int lastRecordedKey;
         private readonly double cyclesPerRpmSample, smoothing, rpmSmoothing;
         private readonly double cyclesPerRpm;
@@ -126,7 +128,11 @@ namespace RpmSynth
             texture = Unit(texture);
             mechanicalDetail = DetailGain(mechanicalDetail);
             resonantDetail = DetailGain(resonantDetail);
-            coloredNoise?.SetBackgroundTrim(backgroundTrimDb ?? defaultBackgroundTrimDb);
+            if (coloredNoise != null && mono.Length > 0)
+            {
+                coloredNoise.SetBackgroundTrim(backgroundTrimDb ?? defaultBackgroundTrimDb, immediate: !trimInitialized);
+                trimInitialized = true;
+            }
 
             for (int i = 0; i < mono.Length; i++)
             {

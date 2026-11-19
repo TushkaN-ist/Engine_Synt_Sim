@@ -10,7 +10,7 @@ namespace RpmSynth
         [SerializeField] private EngineSoundProfile profile;
         [SerializeField, Min(0)] private float rpm = 1000;
         [SerializeField, Range(0, 1)] private float load = 1;
-        [SerializeField, Range(0, 1)] private float gain = 0.8f;
+        [SerializeField, Range(0, 1)] private float gain = EngineSoundSynth.DefaultPlaybackGain;
         [SerializeField, Range(0, 1)] private float texture = 0.5f;
         [SerializeField, Range(0, 2)] private float mechanicalDetail = 1f;
         [SerializeField, Range(0, 2)] private float resonantAttacks = 1f;

@@ -8,7 +8,6 @@ namespace RpmSynth.Editor
     internal sealed class WindowsLiveAudio : IDisposable
     {
         internal const int SampleRate = 48000;
-        private const int BlockSamples = 960;
         private const int BufferCount = 3;
         private const uint CallbackEvent = 0x00050000;
         private const int HeaderDone = 1;
@@ -35,6 +34,7 @@ namespace RpmSynth.Editor
 
         private static readonly uint HeaderSize = (uint)Marshal.SizeOf<WaveHeader>();
         private static readonly int FlagsOffset = Marshal.OffsetOf<WaveHeader>(nameof(WaveHeader.Flags)).ToInt32();
+        private static readonly int LengthOffset = Marshal.OffsetOf<WaveHeader>(nameof(WaveHeader.Length)).ToInt32();
 
         private sealed class Buffer
         {
@@ -44,25 +44,52 @@ namespace RpmSynth.Editor
 
         private readonly AutoResetEvent ready = new AutoResetEvent(false);
         private readonly Buffer[] buffers = new Buffer[BufferCount];
-        private readonly float[] samples = new float[BlockSamples];
-        private readonly short[] pcm = new short[BlockSamples];
-        private readonly Action<float[]> render;
+        private readonly float[] samples;
+        private readonly short[] pcm;
+        private readonly Func<float[], int> render;
         private Thread thread;
         private IntPtr device;
         private volatile bool stopping;
+        private volatile bool completed;
         private string error;
 
         public string Error => Volatile.Read(ref error);
+        public bool IsComplete => completed;
 
-        public WindowsLiveAudio(Action<float[]> render)
+        public WindowsLiveAudio(Action<float[]> render) : this(buffer =>
+        {
+            render(buffer);
+            return buffer.Length;
+        }, SampleRate, 1) { }
+
+        public WindowsLiveAudio(float[] source, int sampleRate, int channels)
+            : this(ReadSequentially(source), sampleRate, channels) { }
+
+        private static Func<float[], int> ReadSequentially(float[] source)
+        {
+            int offset = 0;
+            return buffer =>
+            {
+                int count = Math.Min(buffer.Length, source.Length - offset);
+                Array.Copy(source, offset, buffer, 0, count);
+                offset += count;
+                return count;
+            };
+        }
+
+        private WindowsLiveAudio(Func<float[], int> render, int sampleRate, int channels)
         {
             this.render = render;
+            int blockSamples = Math.Max(1, sampleRate / 50) * channels;
+            samples = new float[blockSamples];
+            pcm = new short[blockSamples];
             try
             {
                 var format = new WaveFormat
                 {
-                    Format = 1, Channels = 1, SampleRate = SampleRate, BytesPerSecond = SampleRate * 2,
-                    BlockAlign = 2, BitsPerSample = 16
+                    Format = 1, Channels = (ushort)channels, SampleRate = (uint)sampleRate,
+                    BytesPerSecond = (uint)(sampleRate * channels * sizeof(short)),
+                    BlockAlign = (ushort)(channels * sizeof(short)), BitsPerSample = 16
                 };
                 Check(waveOutOpen(out device, uint.MaxValue, ref format,
                     ready.SafeWaitHandle.DangerousGetHandle(), IntPtr.Zero, CallbackEvent), "opening the audio device");
@@ -70,9 +97,9 @@ namespace RpmSynth.Editor
                 {
                     var buffer = new Buffer();
                     buffers[i] = buffer;
-                    buffer.Data = Marshal.AllocHGlobal(BlockSamples * 2);
+                    buffer.Data = Marshal.AllocHGlobal(blockSamples * sizeof(short));
                     buffer.Header = Marshal.AllocHGlobal((int)HeaderSize);
-                    Marshal.StructureToPtr(new WaveHeader { Data = buffer.Data, Length = BlockSamples * 2 },
+                    Marshal.StructureToPtr(new WaveHeader { Data = buffer.Data, Length = (uint)(blockSamples * sizeof(short)) },
                         buffer.Header, false);
                     Check(waveOutPrepareHeader(device, buffer.Header, HeaderSize), "preparing the buffer");
                     buffer.Prepared = true;
@@ -96,15 +123,24 @@ namespace RpmSynth.Editor
                 while (!stopping)
                 {
                     var buffer = buffers[next];
-                    if (buffer.Submitted && (Marshal.ReadInt32(buffer.Header, FlagsOffset) & HeaderDone) == 0)
+                    if (IsQueued(buffer))
                     {
                         ready.WaitOne();
                         continue;
                     }
-                    render(samples);
-                    for (int i = 0; i < samples.Length; i++)
-                        pcm[i] = (short)(samples[i] * 32767f);
-                    Marshal.Copy(pcm, 0, buffer.Data, pcm.Length);
+                    int count = render(samples);
+                    if (count == 0)
+                    {
+                        foreach (var submitted in buffers)
+                            while (!stopping && IsQueued(submitted)) ready.WaitOne();
+                        completed = true;
+                        return;
+                    }
+                    for (int i = 0; i < count; i++)
+                        pcm[i] = (short)(Math.Max(-1f, Math.Min(1f, samples[i])) * 32767f);
+                    Marshal.Copy(pcm, 0, buffer.Data, count);
+                    if (count != samples.Length)
+                        Marshal.WriteInt32(buffer.Header, LengthOffset, count * sizeof(short));
                     Check(waveOutWrite(device, buffer.Header, HeaderSize), "submitting an audio buffer");
                     buffer.Submitted = true;
                     next = (next + 1) % buffers.Length;
@@ -115,6 +151,9 @@ namespace RpmSynth.Editor
                 Volatile.Write(ref error, exception.Message);
             }
         }
+
+        private static bool IsQueued(Buffer buffer) =>
+            buffer.Submitted && (Marshal.ReadInt32(buffer.Header, FlagsOffset) & HeaderDone) == 0;
 
         public void Dispose()
         {

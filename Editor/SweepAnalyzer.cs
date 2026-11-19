@@ -17,12 +17,23 @@ namespace RpmSynth.Editor
             }
         }
 
+        internal enum TrackingOrderSource
+        {
+            Cylinders,
+            RpmAnchors,
+            Manual,
+            HarmonicPair
+        }
+
         internal sealed class Result
         {
             public EngineSoundData Data;
             public float[] Times, TrackedRpm, Strength;
             public float[][] Spectrogram;
             public float SpectrogramMaxHz;
+            public int TrackingOrder;
+            public int ReferenceOrder;
+            public TrackingOrderSource TrackingSource;
         }
 
         private const int CandidateCount = 320;
@@ -37,12 +48,11 @@ namespace RpmSynth.Editor
 
         public static Result Analyze(float[] mono, int sampleRate, int cylinders, int revolutions,
             float minimum, float maximum, CancellationToken token, int trackingHarmonic = 0,
-            RpmAnchor[] anchors = null)
+            RpmAnchor[] anchors = null, RpmAnchor[] guidePoints = null, int referenceHarmonic = 0)
         {
             if (sampleRate < 8000 || mono.Length < sampleRate * 0.8)
                 throw new ArgumentException("Use a recording at least 0.8 seconds long with a sample rate of 8 kHz or higher.");
 
-            int trackedOrder = trackingHarmonic == 0 ? cylinders : trackingHarmonic;
             int decimation = Math.Max(1, sampleRate / 12000);
             double rate = (double)sampleRate / decimation;
             var reduced = new float[mono.Length / decimation];
@@ -57,20 +67,26 @@ namespace RpmSynth.Editor
             int hop = (int)(rate * 0.025);
             int frames = (reduced.Length - window) / hop + 1;
             double dt = hop / rate;
-            var anchorFrames = GetAnchorFrames(anchors, frames, (window - 1) * 0.5 / rate, dt);
+            double firstTime = (window - 1) * 0.5 / rate;
+            var anchorFrames = GetAnchorFrames(anchors, frames, firstTime, dt);
+            var pins = BuildTrackingPins(anchors, anchorFrames, guidePoints, frames, firstTime, dt, minimum, maximum);
+            int trackedOrder = trackingHarmonic;
+            var trackingSource = referenceHarmonic > 0 ? TrackingOrderSource.HarmonicPair : TrackingOrderSource.Manual;
+            if (trackedOrder == 0)
+            {
+                if (anchors != null)
+                    trackedOrder = EstimateOrderAtAnchors(reduced, rate, revolutions, anchors, token);
+                trackingSource = trackedOrder > 0 ? TrackingOrderSource.RpmAnchors : TrackingOrderSource.Cylinders;
+                if (trackedOrder == 0) trackedOrder = cylinders;
+            }
             var speeds = new float[CandidateCount];
             double logRange = Math.Log(maximum / minimum);
             for (int i = 0; i < speeds.Length; i++)
                 speeds[i] = (float)(minimum * Math.Exp(logRange * i / (speeds.Length - 1)));
-            if (anchorFrames != null)
+            if (pins.Length > 0)
             {
                 var candidates = new SortedSet<float>(speeds);
-                foreach (var anchor in anchors)
-                {
-                    if (!(anchor.Rpm >= minimum && anchor.Rpm <= maximum))
-                        throw new ArgumentException("RPM anchors must fall inside the search range.");
-                    candidates.Add(anchor.Rpm);
-                }
+                foreach (var pin in pins) candidates.Add(pin.Rpm);
                 speeds = new float[candidates.Count];
                 candidates.CopyTo(speeds);
             }
@@ -81,6 +97,9 @@ namespace RpmSynth.Editor
                 TrackedRpm = new float[frames],
                 Strength = new float[frames],
                 Spectrogram = new float[frames][],
+                TrackingOrder = trackedOrder,
+                ReferenceOrder = referenceHarmonic,
+                TrackingSource = trackingSource,
                 SpectrogramMaxHz = (float)Math.Min(rate / 2, maximum * Math.Max(trackedOrder, cylinders) * 5 / (60 * revolutions))
             };
             var scores = new float[frames, speeds.Length];
@@ -91,8 +110,9 @@ namespace RpmSynth.Editor
             var real = new double[SpectrumSize];
             var imag = new double[SpectrumSize];
             var power = new double[SpectrumSize / 2 + 1];
+            double resolution = (double)SpectrumSize / window;
             double peakEnergy = 0;
-            int segment = 0;
+            int nextPin = 0;
             for (int frame = 0; frame < frames; frame++)
             {
                 token.ThrowIfCancellationRequested();
@@ -127,28 +147,32 @@ namespace RpmSynth.Editor
                 float segmentLow = minimum, segmentHigh = maximum, expected = 0;
                 double maxRise = 20000 * dt, velocityScale = 6000;
                 int pinned = -1;
-                if (anchorFrames != null)
+                while (nextPin < pins.Length && frame > pins[nextPin].Frame) nextPin++;
+                if (nextPin > 0) segmentLow = pins[nextPin - 1].Rpm;
+                if (nextPin < pins.Length)
                 {
-                    if (frame > anchorFrames[segment + 1]) segment++;
-                    int a = anchorFrames[segment], b = anchorFrames[segment + 1];
-                    segmentLow = anchors[segment].Rpm;
-                    segmentHigh = anchors[segment + 1].Rpm;
-                    expected = segmentLow + (segmentHigh - segmentLow) * (frame - a) / (b - a);
-                    double averageRise = (segmentHigh - segmentLow) / (b - a);
-                    maxRise = Math.Max(maxRise, 4 * averageRise);
-                    velocityScale = Math.Max(velocityScale, averageRise / dt);
-                    if (frame == a) pinned = Array.BinarySearch(speeds, segmentLow);
-                    if (frame == b) pinned = Array.BinarySearch(speeds, segmentHigh);
+                    segmentHigh = pins[nextPin].Rpm;
+                    if (frame == pins[nextPin].Frame) pinned = Array.BinarySearch(speeds, segmentHigh);
+                    if (nextPin > 0)
+                    {
+                        int a = pins[nextPin - 1].Frame, b = pins[nextPin].Frame;
+                        expected = segmentLow + (segmentHigh - segmentLow) * (frame - a) / (b - a);
+                        double averageRise = (segmentHigh - segmentLow) / (b - a);
+                        maxRise = Math.Max(maxRise, 4 * averageRise);
+                        velocityScale = Math.Max(velocityScale, averageRise / dt);
+                    }
                 }
                 int first = 0;
                 for (int i = 0; i < speeds.Length; i++)
                 {
                     current[i] = float.NegativeInfinity;
-                    if (anchorFrames != null && ((pinned >= 0 && i != pinned)
+                    if (pins.Length > 0 && ((pinned >= 0 && i != pinned)
                         || speeds[i] < segmentLow || speeds[i] > segmentHigh)) continue;
                     double firingBin = speeds[i] * trackedOrder * SpectrumSize / (60 * revolutions * rate);
-                    float score = CombScore(power, firingBin, floor, (double)SpectrumSize / window);
-                    if (anchorFrames != null)
+                    float score = CombScore(power, firingBin, floor, resolution);
+                    if (referenceHarmonic > 0)
+                        score += PairEvidence(power, firingBin / trackedOrder, trackedOrder, referenceHarmonic, floor, resolution);
+                    if (expected > 0)
                     {
                         // Prefer the expected harmonic without forcing a straight RPM ramp between anchors.
                         double distance = Math.Log(speeds[i] / expected);
@@ -182,7 +206,7 @@ namespace RpmSynth.Editor
             for (int i = 1; i < speeds.Length; i++)
                 if (previous[i] > previous[candidate]) candidate = i;
             if (float.IsNegativeInfinity(previous[candidate]))
-                throw new InvalidOperationException("Could not connect the RPM anchors. Check their times and values.");
+                throw new InvalidOperationException("Could not connect the tracking points. Check that RPM rises across the selected section.");
             for (int i = frames - 1; i >= 0; i--)
             {
                 result.TrackedRpm[i] = speeds[candidate];
@@ -195,16 +219,18 @@ namespace RpmSynth.Editor
             int from = 0, to = frames - 1;
             if (anchorFrames == null)
             {
-                while (from < to && !Usable(result.Strength[from], frameEnergy[from], peakEnergy)) from++;
-                while (to > from && !Usable(result.Strength[to], frameEnergy[to], peakEnergy)) to--;
+                int firstRequired = pins.Length == 0 ? to : pins[0].Frame;
+                int lastRequired = pins.Length == 0 ? from : pins[pins.Length - 1].Frame;
+                while (from < firstRequired && from < to && !Usable(result.Strength[from], frameEnergy[from], peakEnergy)) from++;
+                while (to > lastRequired && to > from && !Usable(result.Strength[to], frameEnergy[to], peakEnergy)) to--;
             }
             if (to - from < 8 || result.TrackedRpm[to] - result.TrackedRpm[from] < 100)
                 throw new InvalidOperationException("Could not detect an RPM sweep. Check the selected section, cylinder count, and RPM search range.");
 
-            if (anchorFrames == null)
+            if (pins.Length == 0)
                 RefineTrack(result.TrackedRpm, speeds, scores);
             else
-                SmoothAnchoredTrack(result.TrackedRpm, anchorFrames);
+                SmoothPinnedTrack(result.TrackedRpm, pins);
             result.Data = Extract(mono, sampleRate, revolutions, result, from, to, dt, token);
             return result;
         }
@@ -226,19 +252,179 @@ namespace RpmSynth.Editor
             return indices;
         }
 
-        private static void SmoothAnchoredTrack(float[] rpm, int[] anchors)
+        private readonly struct TrackingPin
+        {
+            public readonly int Frame;
+            public readonly float Rpm;
+
+            public TrackingPin(int frame, float rpm)
+            {
+                Frame = frame;
+                Rpm = rpm;
+            }
+        }
+
+        private static TrackingPin[] BuildTrackingPins(RpmAnchor[] anchors, int[] anchorFrames, RpmAnchor[] guides,
+            int frames, double firstTime, double dt, float minimum, float maximum)
+        {
+            if (anchorFrames == null && (guides == null || guides.Length == 0)) return Array.Empty<TrackingPin>();
+            var pins = new List<TrackingPin>();
+            if (anchorFrames != null)
+                for (int i = 0; i < anchorFrames.Length; i++)
+                    pins.Add(new TrackingPin(anchorFrames[i], anchors[i].Rpm));
+            if (guides != null)
+                foreach (var guide in guides)
+                {
+                    int frame = Math.Max(0, Math.Min(frames - 1, (int)Math.Round((guide.Time - firstTime) / dt)));
+                    pins.Add(new TrackingPin(frame, guide.Rpm));
+                }
+            pins.Sort((a, b) => a.Frame.CompareTo(b.Frame));
+            for (int i = 0; i < pins.Count; i++)
+            {
+                var pin = pins[i];
+                if (!(pin.Rpm >= minimum && pin.Rpm <= maximum))
+                    throw new ArgumentException($"A tracking point at {pin.Rpm:F0} RPM is outside the search limits. Adjust the point or the RPM range.");
+                if (i == 0) continue;
+                if (pin.Frame == pins[i - 1].Frame)
+                    throw new ArgumentException("Two tracking points fall on the same analysis frame. Keep points and RPM anchors at least 25 ms apart.");
+                if (pin.Rpm < pins[i - 1].Rpm)
+                    throw new ArgumentException("Tracking points must follow rising RPM. Check the chosen lines and points.");
+            }
+            return pins.ToArray();
+        }
+
+        private static void SmoothPinnedTrack(float[] rpm, TrackingPin[] pins)
         {
             var raw = (float[])rpm.Clone();
-            for (int segment = 1; segment < anchors.Length; segment++)
+            int next = 0;
+            for (int i = 1; i < rpm.Length - 1; i++)
             {
-                int first = anchors[segment - 1], last = anchors[segment];
-                for (int i = first + 1; i < last; i++)
-                    rpm[i] = (raw[i - 1] + 2 * raw[i] + raw[i + 1]) * 0.25f;
+                while (next < pins.Length && pins[next].Frame < i) next++;
+                if (next < pins.Length && pins[next].Frame == i) continue;
+                rpm[i] = (raw[i - 1] + 2 * raw[i] + raw[i + 1]) * 0.25f;
             }
+        }
+
+        private static float PairEvidence(double[] power, double cycleBin, int primaryOrder, int referenceOrder,
+            double floor, double resolution)
+        {
+            // Follow both selected ridges, then use weaker cycle orders as supporting evidence.
+            double reference = LineContrast(power, cycleBin * referenceOrder, cycleBin, floor, resolution);
+            double support = 0, weight = 0;
+            for (int order = 1; order <= 16 && cycleBin * order < power.Length - 2; order++)
+            {
+                if (order == primaryOrder || order == referenceOrder) continue;
+                double w = 1 / Math.Sqrt(order);
+                support += w * LineContrast(power, cycleBin * order, cycleBin, floor, resolution);
+                weight += w;
+            }
+            return (float)(.8 * reference + (weight > 0 ? .55 * support / weight : 0));
+        }
+
+        private static double LineContrast(double[] power, double center, double spacing, double floor, double resolution)
+        {
+            if (center < resolution || center >= power.Length - 2) return 0;
+            double side = Math.Min(spacing * .45, 1.5 * resolution);
+            double background = floor + (Sample(power, center - side) + Sample(power, center + side)) * .35;
+            return Math.Log(1 + Sample(power, center) / background);
         }
 
         private static bool Usable(float strength, double energy, double peak)
             => strength > 1.5f && energy > peak * 0.0008;
+
+        private const int MaximumAutomaticTrackingOrder = 16;
+        private const double EstimateWindowSeconds = 0.19;
+        private const double AnchorTolerance = 0.03;
+
+        private sealed class OrderSpectrum
+        {
+            private readonly double[] real = new double[SpectrumSize], imag = new double[SpectrumSize];
+            private readonly double[] power = new double[SpectrumSize / 2 + 1];
+            private readonly int window;
+            private double floor;
+            public readonly double BinsPerHz;
+            public double Resolution => (double)SpectrumSize / window;
+
+            public OrderSpectrum(double rate)
+            {
+                window = Math.Min(SpectrumSize, (int)Math.Round(rate * EstimateWindowSeconds));
+                BinsPerHz = SpectrumSize / rate;
+            }
+
+            public void Read(float[] samples, int center)
+            {
+                int first = Math.Max(0, Math.Min(samples.Length - window, center - window / 2));
+                double mean = 0;
+                for (int i = 0; i < window; i++) mean += samples[first + i];
+                mean /= window;
+                Array.Clear(real, 0, real.Length);
+                Array.Clear(imag, 0, imag.Length);
+                for (int i = 0; i < window; i++) real[i] = (samples[first + i] - mean) * Hann(i, window - 1);
+                EngineSoundFft.Transform(real, imag);
+                floor = 0.001;
+                for (int i = 0; i < power.Length; i++)
+                {
+                    power[i] = Math.Sqrt(Power(real, imag, i));
+                    if (i != 0) floor += power[i] / (power.Length - 1);
+                }
+            }
+
+            public float Score(double bin)
+                => bin >= Resolution * 2 && bin * 2 < power.Length - 2
+                    ? CombScore(power, bin, floor, Resolution) : 0;
+        }
+
+        private static int EstimateOrderAtAnchors(float[] samples, double rate, int revolutions, RpmAnchor[] anchors,
+            CancellationToken token)
+        {
+            var spectrum = new OrderSpectrum(rate);
+            var totals = new double[MaximumAutomaticTrackingOrder + 1];
+            var nearBest = new int[totals.Length];
+            var scores = new float[totals.Length];
+            double lastTime = double.NegativeInfinity;
+            int observations = 0;
+            foreach (var anchor in anchors)
+            {
+                token.ThrowIfCancellationRequested();
+                double time = Math.Max(EstimateWindowSeconds / 2,
+                    Math.Min(samples.Length / rate - EstimateWindowSeconds / 2, anchor.Time));
+                if (time - lastTime < EstimateWindowSeconds) continue;
+                spectrum.Read(samples, (int)Math.Round(time * rate));
+                int winner = 1;
+                for (int order = 1; order <= MaximumAutomaticTrackingOrder; order++)
+                {
+                    double bin = anchor.Rpm * order * spectrum.BinsPerHz / (60 * revolutions);
+                    scores[order] = float.NegativeInfinity;
+                    for (int offset = -2; offset <= 2; offset++)
+                    {
+                        double candidate = bin * (1 + offset * AnchorTolerance / 2);
+                        float score = spectrum.Score(candidate) - .15f * Math.Abs(offset);
+                        scores[order] = Math.Max(scores[order], score);
+                    }
+                    if (scores[order] > scores[winner]) winner = order;
+                }
+                if (scores[winner] < 2) continue;
+                observations++;
+                lastTime = time;
+                for (int order = 1; order <= MaximumAutomaticTrackingOrder; order++)
+                {
+                    totals[order] += scores[order];
+                    if (scores[order] >= scores[winner] - .45f) nearBest[order]++;
+                }
+            }
+
+            if (observations < 2) return 0;
+            int best = 1;
+            for (int order = 2; order <= MaximumAutomaticTrackingOrder; order++)
+                if (totals[order] > totals[best]) best = order;
+            double runnerUp = double.NegativeInfinity;
+            for (int order = 1; order <= MaximumAutomaticTrackingOrder; order++)
+                if (order != best) runnerUp = Math.Max(runnerUp, totals[order]);
+            double lead = (totals[best] - runnerUp) / observations;
+            if (lead < .25 || nearBest[best] * 4 < observations * 3)
+                return 0;
+            return best;
+        }
 
         private static float CombScore(double[] power, double fundamental, double floor, double resolution)
         {

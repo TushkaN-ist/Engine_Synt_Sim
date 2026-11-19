@@ -10,11 +10,10 @@ using UnityEngine;
 
 namespace RpmSynth.Editor
 {
-    public sealed class EngineSoundWindow : EditorWindow
+    public sealed partial class EngineSoundWindow : EditorWindow
     {
         private AudioClip recording, preview;
         private EngineSoundProfile savedProfile;
-        private Texture2D spectrogram;
         private float from, to, minimum = 650, maximum = 8500;
         private bool useRpmAnchors;
         private float startRpm = 1000, endRpm = 8000;
@@ -30,7 +29,8 @@ namespace RpmSynth.Editor
         private float mechanicalDetail = 1;
         private float resonantAttacks = 1;
         private float backgroundTrimDb;
-        private bool analysisSettingsOpen, trackingDetailsOpen, rpmMappingOpen, soundTuningOpen, advancedSoundOpen, wavExportOpen;
+        private bool analysisSettingsOpen, rpmMappingOpen, soundTuningOpen, advancedSoundOpen, wavExportOpen;
+        private bool advancedAnalysisOpen;
         private bool livePreview;
 #if UNITY_EDITOR_WIN
         private WindowsLiveAudio liveAudio;
@@ -66,14 +66,16 @@ namespace RpmSynth.Editor
                 if (recording != null)
                 {
                     EditorGUI.BeginChangeCheck();
-                    cylinders = EditorGUILayout.IntSlider("Cylinders", cylinders, 1, 16);
+                    cylinders = EditorGUILayout.IntSlider(new GUIContent("Cylinders",
+                        "Sets the default harmonic for RPM tracking. A tracking harmonic selected manually or from RPM anchors takes priority."),
+                        cylinders, 1, 16);
                     stroke = EditorGUILayout.Popup("Engine Cycle", stroke, new[] { "Four-Stroke", "Two-Stroke" });
-                    bool engineChanged = EditorGUI.EndChangeCheck();
+                    if (EditorGUI.EndChangeCheck()) ClearResult();
                     analysisSettingsOpen = EditorGUILayout.Foldout(analysisSettingsOpen, "Analysis Settings", true);
-                    EditorGUI.BeginChangeCheck();
                     if (analysisSettingsOpen) DrawAnalysisSettings();
-                    if (EditorGUI.EndChangeCheck() || engineChanged) ClearResult();
-                    if (GUILayout.Button("Analyze Recording")) Run(StartAnalysis);
+                    DrawSpectrumWorkspace();
+                    if (GUILayout.Button(guideEditsPending ? "Analyze with Guides" : "Analyze Recording")) Run(StartAnalysis);
+                    if (!string.IsNullOrEmpty(error)) EditorGUILayout.HelpBox(error, MessageType.Error);
                 }
             }
             if (analysis != null)
@@ -81,17 +83,23 @@ namespace RpmSynth.Editor
                 EditorGUILayout.HelpBox("Tracking RPM and extracting harmonics…", MessageType.Info);
                 if (GUILayout.Button("Cancel")) cancellation.Cancel();
             }
-            if (result != null) DrawResult();
+            if (result != null)
+            {
+                if (guideEditsPending)
+                    EditorGUILayout.HelpBox("Analyze with Guides to apply your edits to the current track and preview.", MessageType.Info);
+                using (new EditorGUI.DisabledScope(guideEditsPending || analysis != null)) DrawResult();
+            }
             else if (analysis == null && savedProfile != null && savedProfile.MaximumRpm > savedProfile.MinimumRpm)
             {
                 DrawPreviewControls(savedProfile.MinimumRpm, savedProfile.MaximumRpm);
-                bool settingsChanged = texture != savedProfile.NoiseAndVariation
-                    || (savedProfile.HasResidualSpectrum && backgroundTrimDb != savedProfile.BackgroundTrimDb);
-                if (settingsChanged && GUILayout.Button("Save Profile Settings"))
+                bool settingsNeedSaving = !savedProfile.HasSavedNoiseAndVariation || texture != savedProfile.NoiseAndVariation
+                    || (savedProfile.HasResidualSpectrum && (!savedProfile.HasSavedBackgroundTrim
+                        || backgroundTrimDb != savedProfile.BackgroundTrimDb));
+                if (settingsNeedSaving && GUILayout.Button("Save Profile Settings"))
                     Run(SaveLoadedProfileSettings);
                 DrawWavExport();
             }
-            if (!string.IsNullOrEmpty(error)) EditorGUILayout.HelpBox(error, MessageType.Error);
+            if (recording == null && !string.IsNullOrEmpty(error)) EditorGUILayout.HelpBox(error, MessageType.Error);
             EditorGUILayout.EndScrollView();
         }
 
@@ -99,16 +107,30 @@ namespace RpmSynth.Editor
         {
             using (new EditorGUI.IndentLevelScope())
             {
+                EditorGUI.BeginChangeCheck();
                 from = EditorGUILayout.FloatField("Start Time (s)", from);
                 to = EditorGUILayout.FloatField("End Time (s)", to);
-                trackingHarmonic = Mathf.Clamp(EditorGUILayout.IntField(new GUIContent("Tracking Harmonic",
-                    "Use 0 to track the firing frequency. Other values specify periods per engine cycle."), trackingHarmonic), 0, 32);
                 useRpmAnchors = EditorGUILayout.Toggle("Use RPM Anchors", useRpmAnchors);
                 if (useRpmAnchors) DrawRpmAnchors();
                 else
                 {
                     minimum = EditorGUILayout.FloatField("Minimum Search RPM", minimum);
                     maximum = EditorGUILayout.FloatField("Maximum Search RPM", maximum);
+                }
+                if (EditorGUI.EndChangeCheck()) ClearResult();
+
+                advancedAnalysisOpen = EditorGUILayout.Foldout(advancedAnalysisOpen, "Advanced", true);
+                if (advancedAnalysisOpen)
+                {
+                    using (new EditorGUI.IndentLevelScope())
+                    {
+                        EditorGUI.BeginChangeCheck();
+                        using (new EditorGUI.DisabledScope(PairInSelection))
+                            trackingHarmonic = Mathf.Clamp(EditorGUILayout.IntField(new GUIContent("Tracking Harmonic",
+                                "Use 0 for automatic selection. Remove the harmonic pair to use a numeric override."),
+                                trackingHarmonic), 0, 32);
+                        if (EditorGUI.EndChangeCheck()) ClearResult();
+                    }
                 }
             }
         }
@@ -150,10 +172,16 @@ namespace RpmSynth.Editor
             EditorGUILayout.Space();
             string rangeLabel = useRpmAnchors ? "Anchored RPM Range" : "Detected RPM Range";
             EditorGUILayout.LabelField($"{rangeLabel} {low:F0}–{high:F0} RPM", EditorStyles.boldLabel);
-            trackingDetailsOpen = EditorGUILayout.Foldout(trackingDetailsOpen, "Tracking Details", true);
-            if (trackingDetailsOpen) DrawTrackingDetails();
+            string trackingSource = result.TrackingSource switch
+            {
+                SweepAnalyzer.TrackingOrderSource.RpmAnchors => "RPM anchors",
+                SweepAnalyzer.TrackingOrderSource.Manual => "Manual override",
+                SweepAnalyzer.TrackingOrderSource.HarmonicPair => "Harmonic pair",
+                _ => "Cylinders"
+            };
+            EditorGUILayout.LabelField("Tracking Harmonic", $"{result.TrackingOrder} ({trackingSource})");
             if (!useRpmAnchors && (low <= minimum * 1.04f || high >= maximum * 0.97f))
-                EditorGUILayout.HelpBox("The RPM track is close to a search limit. Open Tracking Details to check it.", MessageType.Warning);
+                EditorGUILayout.HelpBox("The RPM track is close to a search limit. Check the green line on the spectrogram.", MessageType.Warning);
 
             rpmMappingOpen = EditorGUILayout.Foldout(rpmMappingOpen, "RPM Mapping", true);
             if (rpmMappingOpen)
@@ -168,48 +196,6 @@ namespace RpmSynth.Editor
             using (new EditorGUI.DisabledScope(remapError != null))
                 if (GUILayout.Button("Save Unity Profile…")) Run(SaveProfile);
             DrawWavExport();
-        }
-
-        private void DrawTrackingDetails()
-        {
-            int order = trackingHarmonic == 0 ? cylinders : trackingHarmonic;
-            EditorGUILayout.LabelField($"Spectrum up to {result.SpectrogramMaxHz:F0} Hz. Green line shows harmonic {order}.");
-            Rect chart = GUILayoutUtility.GetRect(100, 160, GUILayout.ExpandWidth(true));
-            if (Event.current.type == EventType.Repaint)
-            {
-                GUI.DrawTexture(chart, spectrogram);
-                Handles.BeginGUI();
-                Color previousColor = Handles.color;
-                Handles.color = new Color(0.50f, 1f, 0.56f);
-                int width = result.Times.Length - 1;
-                float scale = order / (60f * result.Data.RevolutionsPerCycle * result.SpectrogramMaxHz);
-                Vector3 previous = new Vector3(chart.x, chart.yMax - chart.height * result.TrackedRpm[0] * scale);
-                for (int i = 1; i <= width; i++)
-                {
-                    var point = new Vector3(chart.x + chart.width * i / width,
-                        chart.yMax - chart.height * result.TrackedRpm[i] * scale);
-                    Handles.DrawLine(previous, point, 2f);
-                    previous = point;
-                }
-                if (useRpmAnchors)
-                {
-                    DrawAnchorMarker(chart, chart.x, startRpm, scale);
-                    DrawAnchorMarker(chart, chart.xMax, endRpm, scale);
-                    foreach (var checkpoint in rpmCheckpoints)
-                    {
-                        float time = Mathf.InverseLerp(result.Times[0], result.Times[width], checkpoint.x - from);
-                        DrawAnchorMarker(chart, Mathf.Lerp(chart.x, chart.xMax, time), checkpoint.y, scale);
-                    }
-                }
-                Handles.color = previousColor;
-                Handles.EndGUI();
-            }
-            using (new EditorGUILayout.HorizontalScope())
-            {
-                GUILayout.Label($"{from + result.Times[0]:F2} s");
-                GUILayout.FlexibleSpace();
-                GUILayout.Label($"{from + result.Times[result.Times.Length - 1]:F2} s");
-            }
         }
 
         private void DrawRpmMapping()
@@ -249,12 +235,6 @@ namespace RpmSynth.Editor
         }
 
         private EngineSoundData ActiveAnalysis => remappedData ?? result?.Data;
-
-        private static void DrawAnchorMarker(Rect chart, float x, float rpm, float scale)
-        {
-            EditorGUI.DrawRect(new Rect(x - 3, chart.yMax - chart.height * rpm * scale - 3, 6, 6),
-                new Color(1f, 0.72f, 0.24f));
-        }
 
         private void DrawPreviewControls(float low, float high, bool remapped = false)
         {
@@ -368,6 +348,7 @@ namespace RpmSynth.Editor
             to = recording == null ? 0 : recording.length;
             rpmCheckpoints.Clear();
             ClearResult();
+            SetSpectrumRecording();
         }
 
         private void SelectSavedProfile(EngineSoundProfile profile)
@@ -389,20 +370,20 @@ namespace RpmSynth.Editor
                 throw new ArgumentException("Set search limits within 150–30,000 RPM and at least 150 RPM apart.");
 
             var anchors = useRpmAnchors ? BuildRpmAnchors() : null;
-            ClearResult();
+            if (guideEditsPending) StopPreview();
+            else ClearResult();
             int rate = recording.frequency;
-            int start = Mathf.RoundToInt(from * rate);
-            int frames = Math.Min(recording.samples - start, Mathf.RoundToInt((to - from) * rate));
+            GetSelectionFrames(out int start, out int frames);
             int channels = recording.channels;
-            if (recording.loadState != AudioDataLoadState.Loaded) recording.LoadAudioData();
-            var samples = new float[checked(frames * channels)];
-            if (!recording.GetData(samples, start))
-                throw new InvalidOperationException("Set the recording's Load Type to Decompress On Load and enable Preload Audio Data.");
-            float[] mono = channels == 1 ? samples : Downmix(samples, frames, channels);
-            int count = cylinders, revolutions = stroke == 0 ? 2 : 1, order = trackingHarmonic;
+            var samples = ReadRecording(start, frames);
+            int count = cylinders, revolutions = Revolutions;
+            int order = PairInSelection ? harmonicPair.Value.LowerOrder : trackingHarmonic;
+            int referenceOrder = PairInSelection ? harmonicPair.Value.UpperOrder : 0;
+            var guides = BuildVisualGuides(revolutions);
             cancellation = new CancellationTokenSource();
             CancellationToken token = cancellation.Token;
-            analysis = Task.Run(() => SweepAnalyzer.Analyze(mono, rate, count, revolutions, low, high, token, order, anchors), token);
+            analysis = Task.Run(() => SweepAnalyzer.Analyze(channels == 1 ? samples : Downmix(samples, frames, channels),
+                rate, count, revolutions, low, high, token, order, anchors, guides, referenceOrder), token);
             EditorApplication.update += FinishAnalysis;
         }
 
@@ -459,7 +440,8 @@ namespace RpmSynth.Editor
             Run(() =>
             {
                 var output = completed.GetAwaiter().GetResult();
-                spectrogram = BuildSpectrogram(output);
+                displayedOrders = DisplayedHarmonics(output);
+                guideEditsPending = false;
                 if (savedProfile != null)
                 {
                     savedProfile = null;
@@ -473,26 +455,6 @@ namespace RpmSynth.Editor
                 savedMaximumRpm = output.Data.Rpm[output.Data.Rpm.Length - 1];
             });
             Repaint();
-        }
-
-        private static Texture2D BuildSpectrogram(SweepAnalyzer.Result output)
-        {
-            int width = Math.Min(2048, output.Spectrogram.Length), height = output.Spectrogram[0].Length;
-            var map = new Texture2D(width, height, TextureFormat.RGBA32, false) { hideFlags = HideFlags.HideAndDontSave };
-            var pixels = new Color32[width * height];
-            for (int x = 0; x < width; x++)
-            {
-                var frame = output.Spectrogram[x * (output.Spectrogram.Length - 1) / (width - 1)];
-                for (int y = 0; y < height; y++)
-                {
-                    float strength = Mathf.InverseLerp(-68, -12, frame[y]);
-                    pixels[y * width + x] = new Color(0.05f + strength * 0.9f,
-                        0.06f + strength * strength * 0.62f, 0.10f + strength * 0.25f);
-                }
-            }
-            map.SetPixels32(pixels);
-            map.Apply(false, true);
-            return map;
         }
 
         private void StartLivePreview()
@@ -517,8 +479,9 @@ namespace RpmSynth.Editor
         {
             var synth = Volatile.Read(ref liveSynth);
             if (synth == null) Array.Clear(buffer, 0, buffer.Length);
-            else synth.Render(buffer, Volatile.Read(ref rpm), Volatile.Read(ref load), 0.85f, Volatile.Read(ref texture),
-                Volatile.Read(ref mechanicalDetail), Volatile.Read(ref resonantAttacks), Volatile.Read(ref backgroundTrimDb));
+            else synth.Render(buffer, Volatile.Read(ref rpm), Volatile.Read(ref load), EngineSoundSynth.DefaultPlaybackGain,
+                Volatile.Read(ref texture), Volatile.Read(ref mechanicalDetail), Volatile.Read(ref resonantAttacks),
+                Volatile.Read(ref backgroundTrimDb));
         }
 
 #if UNITY_EDITOR_WIN
@@ -547,7 +510,7 @@ namespace RpmSynth.Editor
                 float fraction = i / (float)(blocks - 1);
                 float travel = Mathf.Clamp01((fraction - 0.08f) / 0.84f);
                 float speed = Mathf.Lerp(low, high, travel);
-                float gain = Mathf.Clamp01((1 - fraction) * 25) * 0.85f;
+                float gain = Mathf.Clamp01((1 - fraction) * 25) * EngineSoundSynth.DefaultPlaybackGain;
                 synth.Render(buffer, speed, load, gain, texture, mechanicalDetail, resonantAttacks, backgroundTrimDb);
                 Array.Copy(buffer, 0, samples, i * block, block);
             }
@@ -589,6 +552,8 @@ namespace RpmSynth.Editor
 
         private void StopPreview()
         {
+            EditorApplication.update -= CheckRangePreview;
+            selectionPreview = false;
             Volatile.Write(ref liveSynth, null);
 #if UNITY_EDITOR_WIN
             EditorApplication.update -= CheckLiveAudio;
@@ -647,10 +612,9 @@ namespace RpmSynth.Editor
         private void SaveLoadedProfileSettings()
         {
             Undo.RecordObject(savedProfile, "Change engine sound settings");
-            if (savedProfile.HasResidualSpectrum && backgroundTrimDb != savedProfile.BackgroundTrimDb)
+            if (savedProfile.HasResidualSpectrum)
                 savedProfile.SetBackgroundTrim(backgroundTrimDb);
-            if (texture != savedProfile.NoiseAndVariation)
-                savedProfile.SetNoiseAndVariation(texture);
+            savedProfile.SetNoiseAndVariation(texture);
             EditorUtility.SetDirty(savedProfile);
             AssetDatabase.SaveAssetIfDirty(savedProfile);
         }
@@ -726,8 +690,8 @@ namespace RpmSynth.Editor
             remappedData = null;
             remapError = null;
             StopPreview();
-            if (spectrogram != null) DestroyImmediate(spectrogram);
-            spectrogram = null;
+            guideEditsPending = false;
+            displayedOrders = Array.Empty<int>();
         }
 
         private void OnDisable()
@@ -741,6 +705,7 @@ namespace RpmSynth.Editor
                 _ = analysis.ContinueWith(task => { _ = task.Exception; }, TaskContinuationOptions.OnlyOnFaulted);
                 analysis = null;
             }
+            ReleaseSpectrum();
             ClearResult();
         }
     }
