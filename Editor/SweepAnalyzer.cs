@@ -33,7 +33,9 @@ namespace RpmSynth.Editor
             public float SpectrogramMaxHz;
             public int TrackingOrder;
             public int ReferenceOrder;
+            public int SupportingOrder;
             public TrackingOrderSource TrackingSource;
+            public bool CorrectedHarmonicJump;
         }
 
         private const int CandidateCount = 320;
@@ -103,6 +105,7 @@ namespace RpmSynth.Editor
                 SpectrogramMaxHz = (float)Math.Min(rate / 2, maximum * Math.Max(trackedOrder, cylinders) * 5 / (60 * revolutions))
             };
             var scores = new float[frames, speeds.Length];
+            var ridgeEvidence = pins.Length == 0 && referenceHarmonic == 0 ? new float[frames, speeds.Length] : null;
             var parents = new ushort[frames, speeds.Length];
             var frameEnergy = new double[frames];
             var previous = new float[speeds.Length];
@@ -169,7 +172,8 @@ namespace RpmSynth.Editor
                     if (pins.Length > 0 && ((pinned >= 0 && i != pinned)
                         || speeds[i] < segmentLow || speeds[i] > segmentHigh)) continue;
                     double firingBin = speeds[i] * trackedOrder * SpectrumSize / (60 * revolutions * rate);
-                    float score = CombScore(power, firingBin, floor, resolution);
+                    float score = CombScore(power, firingBin, floor, resolution, out float ridge);
+                    if (ridgeEvidence != null) ridgeEvidence[frame, i] = ridge;
                     if (referenceHarmonic > 0)
                         score += PairEvidence(power, firingBin / trackedOrder, trackedOrder, referenceHarmonic, floor, resolution);
                     if (expected > 0)
@@ -216,6 +220,9 @@ namespace RpmSynth.Editor
 
             if (peakEnergy < 1e-8)
                 throw new InvalidOperationException("The recording is too quiet to analyze.");
+            if (ridgeEvidence != null)
+                result.CorrectedHarmonicJump = TryCorrectHarmonicJump(result, speeds, scores, ridgeEvidence,
+                    parents, reduced, rate, revolutions, dt, token);
             int from = 0, to = frames - 1;
             if (anchorFrames == null)
             {
@@ -372,6 +379,14 @@ namespace RpmSynth.Editor
             public float Score(double bin)
                 => bin >= Resolution * 2 && bin * 2 < power.Length - 2
                     ? CombScore(power, bin, floor, Resolution) : 0;
+
+            public double RidgeStrength(double bin)
+            {
+                if (bin < 2 * Resolution || bin >= power.Length - 2) return 0;
+                double side = Math.Max(1.3 * Resolution, bin * .025);
+                double off = (Sample(power, bin - side) + Sample(power, bin + side)) * .5;
+                return Math.Log(1 + Sample(power, bin) / (floor + .32 * off));
+            }
         }
 
         private static int EstimateOrderAtAnchors(float[] samples, double rate, int revolutions, RpmAnchor[] anchors,
@@ -427,7 +442,11 @@ namespace RpmSynth.Editor
         }
 
         private static float CombScore(double[] power, double fundamental, double floor, double resolution)
+            => CombScore(power, fundamental, floor, resolution, out _);
+
+        private static float CombScore(double[] power, double fundamental, double floor, double resolution, out float ridge)
         {
+            ridge = 0;
             double score = 0, weightSum = 0;
             for (int h = 1; h <= 7 && fundamental * h < power.Length - 2; h++)
             {
@@ -437,7 +456,9 @@ namespace RpmSynth.Editor
                 double on = Sample(power, center);
                 double off = 0.5 * (Sample(power, center - side) + Sample(power, center + side));
                 double background = floor + off * 0.32;
-                score += weight * Math.Log(1 + on / background);
+                double contrast = Math.Log(1 + on / background);
+                if (h == 1) ridge = (float)contrast;
+                score += weight * contrast;
                 weightSum += weight;
             }
             if (weightSum == 0) return 0;
@@ -447,6 +468,159 @@ namespace RpmSynth.Editor
             double octavePenalty = Math.Log(1 + 0.30 * second / (floor + first));
             return (float)(2 * score / weightSum - 0.45 * Math.Log(1 + between / (floor + first))
                 - 0.55 * octavePenalty);
+        }
+
+        private static bool TryCorrectHarmonicJump(Result result, float[] speeds, float[,] comb, float[,] ridge,
+            ushort[,] parents, float[] samples, double rate, int revolutions, double dt, CancellationToken token)
+        {
+            var rpm = result.TrackedRpm;
+            int window = Math.Max(3, (int)Math.Round(.2 / dt));
+            int jump = -1;
+            float largestRatio = 1.35f;
+            for (int left = window; left + 2 * window < rpm.Length; left++)
+            {
+                int right = left + window;
+                float rise = rpm[right] - rpm[left];
+                float neighboringRise = Math.Max(rpm[left] - rpm[left - window], rpm[right + window] - rpm[right]);
+                float ratio = rpm[right] / rpm[left];
+                if (rise < Math.Max(350, 4 * neighboringRise) || ratio <= largestRatio) continue;
+
+                int lower = Array.BinarySearch(speeds, rpm[left]);
+                int higher = Array.BinarySearch(speeds, rpm[right]);
+                int weakFrames = 0;
+                for (int frame = left + 1; frame < right; frame++)
+                {
+                    if (rpm[frame] <= rpm[left] + .18f * rise || rpm[frame] >= rpm[right] - .18f * rise) continue;
+                    int key = Array.BinarySearch(speeds, rpm[frame]);
+                    float sidePeak = Math.Max(ridge[frame, lower], ridge[frame, higher]);
+                    if (ridge[frame, key] + .35f < sidePeak) weakFrames++;
+                }
+                if (weakFrames < 2) continue;
+                largestRatio = ratio;
+                jump = left;
+            }
+            if (jump < 0) return false;
+
+            // In a competing-ridge region, require a continuous path and give the
+            // observed line more weight than harmonics that also fit its submultiple.
+            const float ridgeWeight = 1.3f;
+            double relativeRise = .022 * dt / .025;
+            double maxRise = 20000 * dt;
+            var previous = new float[speeds.Length];
+            var current = new float[speeds.Length];
+            for (int i = 0; i < speeds.Length; i++) previous[i] = comb[0, i] + ridgeWeight * ridge[0, i];
+            for (int frame = 1; frame < rpm.Length; frame++)
+            {
+                token.ThrowIfCancellationRequested();
+                int first = 0;
+                for (int i = 0; i < speeds.Length; i++)
+                {
+                    while (first < i - 1 && speeds[i] - speeds[first] > Math.Min(maxRise, speeds[first] * relativeRise)) first++;
+                    float best = float.NegativeInfinity;
+                    int bestParent = i;
+                    for (int j = first; j <= i; j++)
+                    {
+                        double velocity = (speeds[i] - speeds[j]) / (dt * 6000);
+                        float value = previous[j] - (float)(.009 * velocity * velocity);
+                        if (value <= best) continue;
+                        best = value;
+                        bestParent = j;
+                    }
+                    current[i] = best + comb[frame, i] + ridgeWeight * ridge[frame, i];
+                    parents[frame, i] = (ushort)bestParent;
+                }
+                (previous, current) = (current, previous);
+            }
+            int candidate = 0;
+            for (int i = 1; i < speeds.Length; i++)
+                if (previous[i] > previous[candidate]) candidate = i;
+            var replacement = new ushort[rpm.Length];
+            double originalEvidence = 0, replacementEvidence = 0;
+            for (int frame = rpm.Length - 1; frame >= 0; frame--)
+            {
+                replacement[frame] = (ushort)candidate;
+                int original = Array.BinarySearch(speeds, rpm[frame]);
+                originalEvidence += comb[frame, original] + ridgeWeight * ridge[frame, original];
+                replacementEvidence += comb[frame, candidate] + ridgeWeight * ridge[frame, candidate];
+                candidate = parents[frame, candidate];
+            }
+
+            int end = jump + window;
+            float before = speeds[replacement[jump]] / rpm[jump];
+            float after = speeds[replacement[end]] / rpm[end];
+            bool joinsUpperRidge = before >= 1.25f && Math.Abs(after - 1) <= .09f;
+            bool joinsLowerRidge = after <= .8f && Math.Abs(before - 1) <= .09f;
+            if (!joinsUpperRidge && !joinsLowerRidge) return false;
+            // Near the acceptance boundary, check a second order against the two possible paths.
+            // This cannot rescue a path with substantially worse spectral support.
+            if (replacementEvidence < .96 * originalEvidence)
+            {
+                if (replacementEvidence < .94 * originalEvidence) return false;
+                result.SupportingOrder = FindSupportingOrder(result, speeds, replacement, samples, rate, revolutions,
+                    dt, jump, end, token);
+                if (result.SupportingOrder == 0) return false;
+            }
+
+            for (int frame = 0; frame < rpm.Length; frame++)
+            {
+                int key = replacement[frame];
+                rpm[frame] = speeds[key];
+                result.Strength[frame] = comb[frame, key];
+                for (int i = 0; i < speeds.Length; i++) comb[frame, i] += ridgeWeight * ridge[frame, i];
+            }
+            return true;
+        }
+
+        private static int FindSupportingOrder(Result result, float[] speeds, ushort[] replacement,
+            float[] samples, double rate, int revolutions, double dt, int jumpStart, int jumpEnd, CancellationToken token)
+        {
+            // Establish the supporting line where the paths agree, then see which path it
+            // favors where they diverge. Exact multiples can reinforce an octave error.
+            const double minimumStrength = 1.5;
+            int firstOrder = Math.Max(1, (result.TrackingOrder + 2) / 3);
+            int lastOrder = Math.Min(48, result.TrackingOrder * 3);
+            if (firstOrder > lastOrder) return 0;
+            var commonHits = new int[lastOrder + 1];
+            var supportHits = new int[lastOrder + 1];
+            var spectrum = new OrderSpectrum(rate);
+            double binsPerRpm = spectrum.BinsPerHz / (60 * revolutions);
+            int stride = Math.Max(1, (int)Math.Round(.14 / dt));
+            int common = 0, disputed = 0;
+            for (int frame = stride; frame < replacement.Length - stride; frame += stride)
+            {
+                if (frame >= jumpStart - stride && frame <= jumpEnd + stride) continue;
+                float oldRpm = result.TrackedRpm[frame], newRpm = speeds[replacement[frame]];
+                bool isCommon = Math.Abs(newRpm - oldRpm) <= .06f * oldRpm;
+                if (!isCommon && Math.Abs(newRpm - oldRpm) < .24f * oldRpm) continue;
+                token.ThrowIfCancellationRequested();
+                spectrum.Read(samples, (int)Math.Round(result.Times[frame] * rate));
+                if (isCommon) common++;
+                else disputed++;
+                for (int order = firstOrder; order <= lastOrder; order++)
+                {
+                    if (order % result.TrackingOrder == 0) continue;
+                    double newStrength = spectrum.RidgeStrength(order * newRpm * binsPerRpm);
+                    if (newStrength < minimumStrength) continue;
+                    if (isCommon) commonHits[order]++;
+                    else if (newStrength > spectrum.RidgeStrength(order * oldRpm * binsPerRpm) + .35)
+                        supportHits[order]++;
+                }
+            }
+            if (common < 6 || disputed < 6) return 0;
+            int best = 0;
+            double bestCoverage = 0;
+            for (int order = firstOrder; order <= lastOrder; order++)
+            {
+                double commonCoverage = (double)commonHits[order] / common;
+                double disputedCoverage = (double)supportHits[order] / disputed;
+                // Require a recognizable line on the shared path and stronger agreement where it matters.
+                if (commonCoverage < .55 || disputedCoverage < .65) continue;
+                double coverage = Math.Min(commonCoverage, disputedCoverage);
+                if (coverage <= bestCoverage) continue;
+                best = order;
+                bestCoverage = coverage;
+            }
+            return best;
         }
 
         private static void RefineTrack(float[] rpm, float[] speeds, float[,] scores)

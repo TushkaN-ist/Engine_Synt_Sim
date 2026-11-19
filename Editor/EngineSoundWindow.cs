@@ -180,6 +180,8 @@ namespace RpmSynth.Editor
                 _ => "Cylinders"
             };
             EditorGUILayout.LabelField("Tracking Harmonic", $"{result.TrackingOrder} ({trackingSource})");
+            if (result.SupportingOrder > 0)
+                EditorGUILayout.LabelField("Supporting Harmonic", $"{result.SupportingOrder} (automatic)");
             if (!useRpmAnchors && (low <= minimum * 1.04f || high >= maximum * 0.97f))
                 EditorGUILayout.HelpBox("The RPM track is close to a search limit. Check the green line on the spectrogram.", MessageType.Warning);
 

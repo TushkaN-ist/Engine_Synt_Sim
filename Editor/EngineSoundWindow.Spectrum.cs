@@ -252,9 +252,12 @@ namespace RpmSynth.Editor
             EditorGUILayout.LabelField("Scroll: frequency   Shift + scroll: time   Ctrl + scroll: zoom at cursor",
                 EditorStyles.wordWrappedMiniLabel);
             if (result != null)
-                EditorGUILayout.LabelField(result.ReferenceOrder > 0
-                    ? "Green: tracked harmonic   Orange line: second guide   Teal: extracted harmonics"
-                    : "Green: tracked harmonic   Teal: extracted harmonics", EditorStyles.wordWrappedMiniLabel);
+            {
+                string secondary = result.SupportingOrder > 0 ? "Orange: supporting harmonic   "
+                    : result.ReferenceOrder > 0 ? "Orange: second guide   " : "";
+                EditorGUILayout.LabelField("Green: tracked harmonic   " + secondary + "Teal: extracted harmonics",
+                    EditorStyles.wordWrappedMiniLabel);
+            }
 
             EditorGUILayout.LabelField("Selected Range", $"{from:F3}–{to:F3} s  ({to - from:F3} s)");
             using (new EditorGUILayout.HorizontalScope())
@@ -625,7 +628,8 @@ namespace RpmSynth.Editor
                 if (showHarmonics)
                     foreach (int order in displayedOrders)
                         DrawRidge(local, top, order, new Color(.47f, .87f, .87f, .38f), 1f);
-                if (result.ReferenceOrder > 0) DrawRidge(local, top, result.ReferenceOrder, PairColor, 1.5f);
+                int secondOrder = Math.Max(result.ReferenceOrder, result.SupportingOrder);
+                if (secondOrder > 0) DrawRidge(local, top, secondOrder, PairColor, 1.5f);
                 DrawRidge(local, top, result.TrackingOrder, TrackColor, 2f);
             }
             Handles.color = oldColor;
@@ -720,7 +724,8 @@ namespace RpmSynth.Editor
                 }
             var orders = new List<int>();
             for (int h = 0; h < powers.Length; h++)
-                if (powers[h] > strongest * .000025f && h + 1 != analysisResult.TrackingOrder && h + 1 != analysisResult.ReferenceOrder)
+                if (powers[h] > strongest * .000025f && h + 1 != analysisResult.TrackingOrder
+                    && h + 1 != analysisResult.ReferenceOrder && h + 1 != analysisResult.SupportingOrder)
                     orders.Add(h + 1);
             orders.Sort((a, b) => powers[b - 1].CompareTo(powers[a - 1]));
             if (orders.Count > 36) orders.RemoveRange(36, orders.Count - 36);
